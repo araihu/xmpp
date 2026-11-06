@@ -16,6 +16,7 @@ import (
 	"mellium.im/xmlstream"
 	"mellium.im/xmpp/internal/attr"
 	"mellium.im/xmpp/internal/ns"
+	"mellium.im/xmpp/internal/xmpptest"
 	"mellium.im/xmpp/jid"
 	"mellium.im/xmpp/stanza"
 )
@@ -33,11 +34,11 @@ type iqTest struct {
 var iqTests = [...]iqTest{
 	0: {
 		to:      "new@example.net",
-		payload: &testReader{},
+		payload: &xmpptest.Tokens{},
 	},
 	1: {
 		to:      "new@example.org",
-		payload: &testReader{start, start.End()},
+		payload: &xmpptest.Tokens{start, start.End()},
 		out:     `<ping></ping>`,
 		typ:     stanza.GetIQ,
 	},

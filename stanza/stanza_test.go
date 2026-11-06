@@ -8,25 +8,14 @@ import (
 	"bytes"
 	"encoding/xml"
 	"fmt"
-	"io"
 	"strings"
 	"testing"
 
 	"mellium.im/xmlstream"
+	"mellium.im/xmpp/internal/xmpptest"
 	"mellium.im/xmpp/jid"
 	"mellium.im/xmpp/stanza"
 )
-
-type testReader []xml.Token
-
-func (r *testReader) Token() (t xml.Token, err error) {
-	tr := *r
-	if len(tr) < 1 {
-		return nil, io.EOF
-	}
-	t, *r = tr[0], tr[1:]
-	return t, nil
-}
 
 var start = xml.StartElement{
 	Name: xml.Name{Local: "ping"},
@@ -43,11 +32,11 @@ type messageTest struct {
 var messageTests = [...]messageTest{
 	0: {
 		to:      "new@example.net",
-		payload: &testReader{},
+		payload: &xmpptest.Tokens{},
 	},
 	1: {
 		to:      "new@example.org",
-		payload: &testReader{start, start.End()},
+		payload: &xmpptest.Tokens{start, start.End()},
 		out:     `<ping></ping>`,
 		typ:     stanza.NormalMessage,
 	},

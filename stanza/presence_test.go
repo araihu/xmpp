@@ -14,6 +14,7 @@ import (
 	"mellium.im/xmlstream"
 	"mellium.im/xmpp/internal/attr"
 	"mellium.im/xmpp/internal/ns"
+	"mellium.im/xmpp/internal/xmpptest"
 	"mellium.im/xmpp/jid"
 	"mellium.im/xmpp/stanza"
 )
@@ -41,11 +42,11 @@ var wrapPresenceTests = [...]struct {
 		out: `<presence type="subscribed" to="example.net"></presence>`,
 	},
 	4: {
-		payload: &testReader{},
+		payload: &xmpptest.Tokens{},
 		out:     `<presence></presence>`,
 	},
 	5: {
-		payload: &testReader{start, start.End()},
+		payload: &xmpptest.Tokens{start, start.End()},
 		out:     `<presence><ping></ping></presence>`,
 	},
 }
