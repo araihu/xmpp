@@ -18,6 +18,10 @@ import (
 	"mellium.im/xmpp/stream"
 )
 
+// XMLHeader is an XML header like the one in encoding/xml but
+// without a newline at the end.
+const XMLHeader = `<?xml version="1.0" encoding="UTF-8"?>`
+
 const wsNamespace = "urn:ietf:params:xml:ns:xmpp-framing"
 
 // Send sends a new XML header followed by a stream start element on the given
@@ -39,7 +43,7 @@ func Send(rw io.ReadWriter, streamData *stream.Info, ws bool, version stream.Ver
 		)
 	} else {
 		_, err = fmt.Fprintf(b,
-			decl.XMLHeader+`<stream:stream xmlns='%s' xmlns:stream='http://etherx.jabber.org/streams' version='%s'`,
+			XMLHeader+`<stream:stream xmlns='%s' xmlns:stream='http://etherx.jabber.org/streams' version='%s'`,
 			streamData.XMLNS,
 			version,
 		)

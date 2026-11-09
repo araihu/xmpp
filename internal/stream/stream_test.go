@@ -13,7 +13,6 @@ import (
 	"strings"
 	"testing"
 
-	"mellium.im/xmpp/internal/decl"
 	intstream "mellium.im/xmpp/internal/stream"
 	"mellium.im/xmpp/stanza"
 	"mellium.im/xmpp/stream"
@@ -131,10 +130,10 @@ func TestSendNewS2S(t *testing.T) {
 			err := intstream.Send(&b, &out, false, stream.Version{Major: 1, Minor: 0}, "und", "example.net", "test@example.net", ids)
 
 			str := b.String()
-			if !strings.HasPrefix(str, decl.XMLHeader) {
+			if !strings.HasPrefix(str, intstream.XMLHeader) {
 				t.Errorf("Expected string to start with XML header but got: %s", str)
 			}
-			str = strings.TrimPrefix(str, decl.XMLHeader)
+			str = strings.TrimPrefix(str, intstream.XMLHeader)
 
 			switch {
 			case err != tc.err:
