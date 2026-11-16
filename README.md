@@ -38,6 +38,33 @@ look in the `examples/` tree for several simple usage examples.
 If you'd like to contribute to the project, see [CONTRIBUTING.md].
 
 
+## Client stream management
+
+This fork adds opt-in [XEP-0198] for authenticated TLS client streams using
+SASL and regular resource binding. Keep one `xmpp.StreamManagement` per
+account and call its `Connect` method with each new TCP connection and the
+usual STARTTLS, SASL, and bind features.
+
+Run `Session.Serve` to consume incoming stanzas. Return success only after the
+application has accepted responsibility for the stanza. For a stored message,
+that means after committing it or confirming that it was already stored. Close
+the transport and wait for `Serve` to return before reconnecting, or call
+`Session.Close` to end the logical stream deliberately.
+
+`Session.StreamManagement().Resumed` distinguishes an accepted resumption
+from a fresh bind. A resumed stream keeps its resource and replays the exact
+bytes of its unacknowledged outbound stanzas. An unavailable or refused
+resumption discards the old replay queue. The application can use its own
+archive recovery and reconciliation on the fresh stream.
+
+The replay queue is limited to 256 stanzas and 4 MiB. If it fills, the send
+returns `ErrStreamManagementQueueFull` and the connection closes so the
+remaining stanzas can be resumed. Resumption state stays in memory and lasts
+for the lifetime of the process.
+
+[XEP-0198]: https://xmpp.org/extensions/xep-0198.html
+
+
 ## License
 
 The package may be used under the terms of the BSD 2-Clause License a copy of

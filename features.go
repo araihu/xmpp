@@ -270,6 +270,9 @@ func negotiateFeatures(ctx context.Context, s *Session, first, ws bool, features
 			s.state |= mask
 		}
 		s.negotiated[data.feature.Name.Space] = struct{}{}
+		if err != nil || mask&Ready != 0 {
+			return mask, rw, err
+		}
 
 		// If we negotiated a required feature or a stream restart is required
 		// we're done with this feature set.

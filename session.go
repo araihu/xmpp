@@ -166,6 +166,11 @@ type Session struct {
 	}
 
 	ws bool
+
+	sm          *smState
+	smWriter    *smWriter
+	smResumed   bool
+	smReadAhead *smReadAhead
 }
 
 var _ tlsConn = (*Session)(nil)
@@ -458,6 +463,10 @@ func (s *Session) Serve(h Handler) (err error) {
 	}
 
 	defer func() {
+		if s.sm != nil {
+			s.finishManagedServe(err)
+			return
+		}
 		s.closeInputStream()
 		e := s.Close()
 		if err == nil {
@@ -478,6 +487,9 @@ func (s *Session) Serve(h Handler) (err error) {
 		case io.EOF:
 			return nil
 		default:
+			if s.sm != nil {
+				return err
+			}
 			return s.sendError(err)
 		}
 	}
@@ -567,6 +579,21 @@ func handleInputStream(s *Session, handler Handler) (err error) {
 		return fmt.Errorf("xmpp: stream in a bad state, expected start element or whitespace but got %T", tok)
 	}
 
+	if s.sm != nil {
+		if start.Name.Space == smNamespace {
+			return s.handleSM(r, start)
+		}
+		if stanza.Is(start.Name, s.in.XMLNS) {
+			defer func() {
+				if err == nil {
+					s.sm.mu.Lock()
+					s.sm.handled++
+					s.sm.mu.Unlock()
+				}
+			}()
+		}
+	}
+
 	// If this is a stanza, normalize the "from" attribute.
 	if stanza.Is(start.Name, s.in.XMLNS) {
 		for i, attr := range start.Attr {
@@ -592,7 +619,7 @@ func handleInputStream(s *Session, handler Handler) (err error) {
 		readerChan, ok := s.sentStanzas[id]
 		s.sentStanzaMutex.Unlock()
 		emptySpace := xml.Name{Local: start.Name.Local}
-		if ok && readerChan.stanzaName == start.Name || readerChan.stanzaName == emptySpace {
+		if ok && (readerChan.stanzaName == start.Name || readerChan.stanzaName == emptySpace) {
 			inner := xmlstream.Inner(r)
 			select {
 			case readerChan.c <- iqResponder{
@@ -622,6 +649,9 @@ func handleInputStream(s *Session, handler Handler) (err error) {
 		id:          id,
 	}
 	if err := handler.HandleXMPP(rw, &start); err != nil {
+		if s.sm != nil && err == io.EOF {
+			return fmt.Errorf("xmpp: stanza handler: %w", err)
+		}
 		return err
 	}
 
@@ -761,11 +791,12 @@ func (lwc *lockWriteCloser) Flush() error {
 	return lwc.w.out.e.Flush()
 }
 
-func (lwc *lockWriteCloser) Close() error {
+func (lwc *lockWriteCloser) Close() (err error) {
 	if lwc.err != nil {
 		return nil
 	}
 	defer lwc.m.Unlock()
+	defer lwc.w.endManagedWrite(&err)
 	if err := lwc.Flush(); err != nil {
 		lwc.err = err
 		return err
@@ -853,6 +884,9 @@ func (s *Session) closeSession() error {
 	}
 
 	s.state |= OutputStreamClosed
+	if s.sm != nil {
+		return s.closeManagedStream()
+	}
 	// We wrote the opening stream instead of encoding it, so do the same with the
 	// closing to ensure that the encoder doesn't think the tokens are mismatched.
 	return intstream.Close(s.Conn(), &s.out.Info)
@@ -905,9 +939,13 @@ func (s *Session) SetCloseDeadline(t time.Time) error {
 // Encode writes the XML encoding of v to the stream.
 //
 // For more information see "encoding/xml".Encode.
-func (s *Session) Encode(ctx context.Context, v interface{}) error {
+func (s *Session) Encode(ctx context.Context, v interface{}) (err error) {
 	s.out.Lock()
 	defer s.out.Unlock()
+	if s.sm != nil && s.State()&OutputStreamClosed != 0 {
+		return ErrOutputStreamClosed
+	}
+	defer s.endManagedWrite(&err)
 
 	defer setWriteDeadline(ctx, s.conn)()
 	return marshal.EncodeXML(s.out.e, v)
@@ -917,9 +955,13 @@ func (s *Session) Encode(ctx context.Context, v interface{}) error {
 // outermost tag in the encoding.
 //
 // For more information see "encoding/xml".EncodeElement.
-func (s *Session) EncodeElement(ctx context.Context, v interface{}, start xml.StartElement) error {
+func (s *Session) EncodeElement(ctx context.Context, v interface{}, start xml.StartElement) (err error) {
 	s.out.Lock()
 	defer s.out.Unlock()
+	if s.sm != nil && s.State()&OutputStreamClosed != 0 {
+		return ErrOutputStreamClosed
+	}
+	defer s.endManagedWrite(&err)
 
 	defer setWriteDeadline(ctx, s.conn)()
 	return marshal.EncodeXMLElement(s.out.e, v, start)
@@ -940,9 +982,13 @@ func (s *Session) SendElement(ctx context.Context, r xml.TokenReader, start xml.
 	return send(ctx, s, r, &start)
 }
 
-func send(ctx context.Context, s *Session, r xml.TokenReader, start *xml.StartElement) error {
+func send(ctx context.Context, s *Session, r xml.TokenReader, start *xml.StartElement) (err error) {
 	s.out.Lock()
 	defer s.out.Unlock()
+	if s.sm != nil && s.State()&OutputStreamClosed != 0 {
+		return ErrOutputStreamClosed
+	}
+	defer s.endManagedWrite(&err)
 
 	defer setWriteDeadline(ctx, s.conn)()
 
@@ -960,7 +1006,7 @@ func send(ctx context.Context, s *Session, r xml.TokenReader, start *xml.StartEl
 		r = xmlstream.Inner(r)
 	}
 
-	err := s.out.e.EncodeToken(*start)
+	err = s.out.e.EncodeToken(*start)
 	if err != nil {
 		return err
 	}
