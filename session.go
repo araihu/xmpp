@@ -918,9 +918,6 @@ func (s *Session) TokenReader() xmlstream.TokenReadCloser {
 // Calling Close() multiple times will only result in one closing
 // </stream:stream> being sent.
 func (s *Session) Close() error {
-	if s.State()&OutputStreamClosed != 0 {
-		return nil
-	}
 	replayErr := s.waitForReplay(context.Background())
 	s.out.Lock()
 	defer s.out.Unlock()
