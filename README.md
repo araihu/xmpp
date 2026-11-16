@@ -1,5 +1,15 @@
 # XMPP
 
+This repository is the Arai Hû fork of [Mellium XMPP], the Go XMPP library
+developed by the Mellium Contributors. The upstream authors and contributors
+are credited in [CONTRIBUTORS](CONTRIBUTORS). Their work remains available
+under the original [BSD 2-Clause license](LICENSE).
+
+Arai Hû maintains this fork for Oiê and publishes its own releases. Its first
+addition is opt-in client stream management and resumption (XEP-0198).
+
+[Mellium XMPP]: https://codeberg.org/mellium/xmpp
+
 [![GoDoc](https://godoc.org/mellium.im/xmpp?status.svg)][docs]
 [![Chat](https://img.shields.io/badge/XMPP-users@mellium.chat-orange.svg)](https://mellium.chat)
 [![License](https://img.shields.io/badge/license-FreeBSD-blue.svg)](https://opensource.org/licenses/BSD-2-Clause)
@@ -52,8 +62,7 @@ processes the peer's traffic while the client's replay is still running.
 New application writes follow the replay. Return success from the handler
 only after the application has accepted responsibility for the stanza. For a
 stored message, that means after committing it or confirming that it was
-already stored. Close
-the transport and wait for `Serve` to return before reconnecting, or call
+already stored. Close the transport and wait for `Serve` to return before reconnecting, or call
 `Session.Close` to end the logical stream deliberately.
 
 `Session.StreamManagement().Resumed` distinguishes an accepted resumption
