@@ -185,7 +185,8 @@ func (c *Client) HandlePresence(p stanza.Presence, r xmlstream.TokenReadEncoder)
 	// the channel.
 	c.managedM.Lock()
 	defer c.managedM.Unlock()
-	channel, ok := c.managed[p.From.String()]
+	roomAddr := p.From.String()
+	channel, ok := c.managed[roomAddr]
 	// TODO: what do we do with presences that aren't managed?
 	if !ok {
 		return nil
@@ -219,11 +220,9 @@ func (c *Client) HandlePresence(p stanza.Presence, r xmlstream.TokenReadEncoder)
 			c.HandleUserPresence(decodedPresence.Presence, decodedPresence.X.Item)
 		}
 	case stanza.UnavailablePresence:
-		delete(c.managed, channel.addr.String())
-		select {
-		case channel.depart <- struct{}{}:
-		default:
-		}
+		delete(c.managed, roomAddr)
+		// Leave can start waiting after the server confirms the departure.
+		close(channel.depart)
 	}
 	return nil
 }
