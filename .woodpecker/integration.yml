@@ -4,13 +4,13 @@
 
 steps:
   info: &info
-    image: golang:1.26-alpine
+    image: golang:1.26.11-alpine
     environment:
       CGO_ENABLED: "0"
       MELLIUM_INTEGRATION_SKIP: "ejabberdctl,sendxmpp,mcabber,jackal"
     commands:
       - apk update
-      - apk add go python3 lua5.2
+      - apk add python3 lua5.2
       - go version
       - go env
       - python --version
@@ -26,7 +26,7 @@ steps:
 
         EOF
       - apk update
-      - apk add go python3 lua5.2 py3-slixmpp py3-aioxmpp openssl prosody lua-unbound jackal
+      - apk add python3 lua5.2 py3-slixmpp py3-aioxmpp openssl prosody lua-unbound jackal
       - go test -v -tags "integration" -run Integration ./...
 depends_on:
   - dco

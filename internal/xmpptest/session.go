@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 
 	"mellium.im/xmpp"
 	intstream "mellium.im/xmpp/internal/stream"
@@ -151,6 +152,9 @@ type ClientServer struct {
 	Client *xmpp.Session
 	Server *xmpp.Session
 
+	clientConn net.Conn
+	serving    sync.WaitGroup
+
 	clientHandler xmpp.Handler
 	serverHandler xmpp.Handler
 	clientState   xmpp.SessionState
@@ -175,20 +179,17 @@ func NewClientServer(opts ...Option) *ClientServer {
 	}
 
 	clientConn, serverConn := net.Pipe()
+	cs.clientConn = clientConn
 	cs.Client = NewClientSession(cs.clientState, cs.clientJid, cs.serverJid, clientConn)
 	cs.Server = NewServerSession(cs.serverState, cs.clientJid, cs.serverJid, serverConn)
-	/* #nosec */
-	go cs.Client.Serve(cs.clientHandler)
-	/* #nosec */
-	go cs.Server.Serve(cs.serverHandler)
+	cs.serving.Go(func() { _ = cs.Client.Serve(cs.clientHandler) })
+	cs.serving.Go(func() { _ = cs.Server.Serve(cs.serverHandler) })
 	return cs
 }
 
-// Close calls the client and server sessions' close methods.
+// Close closes the test transport and waits for both serve loops to exit.
 func (cs *ClientServer) Close() error {
-	err := cs.Client.Close()
-	if err != nil {
-		return err
-	}
-	return cs.Server.Close()
+	err := cs.clientConn.Close()
+	cs.serving.Wait()
+	return err
 }

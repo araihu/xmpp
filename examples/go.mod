@@ -1,6 +1,6 @@
 module mellium.im/xmpp/examples
 
-go 1.26.0
+go 1.26.11
 
 require (
 	github.com/rivo/tview v0.0.0-20241103174730-c76f7879f592
