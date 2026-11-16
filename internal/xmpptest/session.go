@@ -151,6 +151,8 @@ type ClientServer struct {
 	Client *xmpp.Session
 	Server *xmpp.Session
 
+	clientConn net.Conn
+
 	clientHandler xmpp.Handler
 	serverHandler xmpp.Handler
 	clientState   xmpp.SessionState
@@ -175,6 +177,7 @@ func NewClientServer(opts ...Option) *ClientServer {
 	}
 
 	clientConn, serverConn := net.Pipe()
+	cs.clientConn = clientConn
 	cs.Client = NewClientSession(cs.clientState, cs.clientJid, cs.serverJid, clientConn)
 	cs.Server = NewServerSession(cs.serverState, cs.clientJid, cs.serverJid, serverConn)
 	/* #nosec */
@@ -184,11 +187,8 @@ func NewClientServer(opts ...Option) *ClientServer {
 	return cs
 }
 
-// Close calls the client and server sessions' close methods.
+// Close closes the test transport and unblocks both session loops. Tests
+// using the fixture can exercise graceful stream closure explicitly.
 func (cs *ClientServer) Close() error {
-	err := cs.Client.Close()
-	if err != nil {
-		return err
-	}
-	return cs.Server.Close()
+	return cs.clientConn.Close()
 }
