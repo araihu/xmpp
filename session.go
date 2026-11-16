@@ -68,7 +68,7 @@ type deferWriter struct {
 
 func (dw *deferWriter) EncodeToken(t xml.Token) error {
 	if dw.w == nil {
-		dw.w = dw.s.TokenWriter()
+		dw.w = dw.s.tokenWriter()
 	}
 	return dw.w.EncodeToken(t)
 }
@@ -131,6 +131,19 @@ type tokenReadChan struct {
 	ctx        context.Context
 }
 
+type stanzaReplies struct {
+	mu      sync.Mutex
+	pending map[string]tokenReadChan
+	ended   chan struct{}
+}
+
+func (s *Session) replyRegistry() *stanzaReplies {
+	if s.sm != nil {
+		return &s.sm.replies
+	}
+	return &s.replies
+}
+
 // A Session represents an XMPP session comprising an input and an output XML
 // stream.
 type Session struct {
@@ -146,8 +159,7 @@ type Session struct {
 	// The negotiated features (by namespace) for the current session.
 	negotiated map[string]struct{}
 
-	sentStanzaMutex sync.Mutex
-	sentStanzas     map[string]tokenReadChan
+	replies stanzaReplies
 
 	in struct {
 		stream.Info
@@ -167,10 +179,14 @@ type Session struct {
 
 	ws bool
 
-	sm          *smState
-	smWriter    *smWriter
-	smResumed   bool
-	smReadAhead *smReadAhead
+	sm           *smState
+	smWriter     *smWriter
+	smResumed    bool
+	smReadAhead  *smReadAhead
+	smPreEnabled int
+	smReplay     *smReplay
+	smDone       chan struct{}
+	smServing    bool // Guarded by stateMutex.
 }
 
 var _ tlsConn = (*Session)(nil)
@@ -203,33 +219,28 @@ func ReceiveSession(ctx context.Context, rw io.ReadWriter, state SessionState, n
 }
 
 func setDeadline(ctx context.Context, conn net.Conn) context.CancelFunc {
-	cancelCtx, cancel := context.WithCancel(context.Background())
-	go func() {
-		select {
-		case <-ctx.Done():
-			/* #nosec */
-			conn.SetDeadline(aLongTimeAgo)
-			/* #nosec */
-			conn.SetDeadline(time.Time{})
-		case <-cancelCtx.Done():
-		}
-	}()
-	return cancel
+	return interruptOnCancel(ctx, conn.SetDeadline)
 }
 
 func setWriteDeadline(ctx context.Context, conn net.Conn) context.CancelFunc {
-	cancelCtx, cancel := context.WithCancel(context.Background())
-	go func() {
-		select {
-		case <-ctx.Done():
-			/* #nosec */
-			conn.SetWriteDeadline(aLongTimeAgo)
-			/* #nosec */
-			conn.SetWriteDeadline(time.Time{})
-		case <-cancelCtx.Done():
+	return interruptOnCancel(ctx, conn.SetWriteDeadline)
+}
+
+func interruptOnCancel(ctx context.Context, deadline func(time.Time) error) context.CancelFunc {
+	if ctx.Done() == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = deadline(aLongTimeAgo)
+		close(done)
+	})
+	return func() {
+		if !stop() {
+			<-done
+			_ = deadline(time.Time{})
 		}
-	}()
-	return cancel
+	}
 }
 
 func negotiateSession(ctx context.Context, location, origin jid.JID, rw io.ReadWriter, state SessionState, negotiate Negotiator) (*Session, error) {
@@ -248,12 +259,11 @@ func negotiateSession(ctx context.Context, location, origin jid.JID, rw io.ReadW
 	// For more information see the internal/wskey package.
 	wsCtx := ctx.Value(wskey.Key{})
 	s := &Session{
-		conn:        newConn(rw, nil),
-		features:    make(map[string]interface{}),
-		negotiated:  make(map[string]struct{}),
-		sentStanzas: make(map[string]tokenReadChan),
-		state:       state,
-		ws:          wsCtx != nil,
+		conn:       newConn(rw, nil),
+		features:   make(map[string]interface{}),
+		negotiated: make(map[string]struct{}),
+		state:      state,
+		ws:         wsCtx != nil,
 	}
 
 	if s.state&Received == Received {
@@ -458,13 +468,28 @@ func ReceiveServerSession(ctx context.Context, location, origin jid.JID, rw io.R
 // methods or a deadlock will occur.
 // After Serve finishes running the handler, it flushes the output stream.
 func (s *Session) Serve(h Handler) (err error) {
+	if s.sm != nil {
+		s.stateMutex.Lock()
+		if s.smServing {
+			s.stateMutex.Unlock()
+			return errors.New("xmpp: managed session is already serving")
+		}
+		s.smServing = true
+		s.stateMutex.Unlock()
+
+		s.in.Lock()
+		s.smReadAhead = newSMReadAhead(s, s.in.d)
+		s.in.d = s.smReadAhead
+		s.in.Unlock()
+	}
+	graceful := false
 	if h == nil {
 		h = nopHandler{}
 	}
 
 	defer func() {
 		if s.sm != nil {
-			s.finishManagedServe(err)
+			s.finishManagedServe(err, graceful)
 			return
 		}
 		s.closeInputStream()
@@ -485,6 +510,7 @@ func (s *Session) Serve(h Handler) (err error) {
 		case nil:
 			// No error and no sentinal error telling us to shut down; try again!
 		case io.EOF:
+			graceful = true
 			return nil
 		default:
 			if s.sm != nil {
@@ -579,19 +605,28 @@ func handleInputStream(s *Session, handler Handler) (err error) {
 		return fmt.Errorf("xmpp: stream in a bad state, expected start element or whitespace but got %T", tok)
 	}
 
+	counted := false
+	handled := false
 	if s.sm != nil {
 		if start.Name.Space == smNamespace {
 			return s.handleSM(r, start)
 		}
 		if stanza.Is(start.Name, s.in.XMLNS) {
-			defer func() {
-				if err == nil {
-					s.sm.mu.Lock()
-					s.sm.handled++
-					s.sm.mu.Unlock()
-				}
-			}()
+			if s.smPreEnabled > 0 {
+				s.smPreEnabled--
+			} else {
+				counted = true
+			}
 		}
+	}
+	if counted {
+		defer func() {
+			if handled {
+				s.sm.mu.Lock()
+				s.sm.handled++
+				s.sm.mu.Unlock()
+			}
+		}()
 	}
 
 	// If this is a stanza, normalize the "from" attribute.
@@ -615,9 +650,10 @@ func handleInputStream(s *Session, handler Handler) (err error) {
 	_, _, id, typ := getIDTyp(start.Attr)
 
 	if typ == string(stanza.ResultIQ) || typ == "error" {
-		s.sentStanzaMutex.Lock()
-		readerChan, ok := s.sentStanzas[id]
-		s.sentStanzaMutex.Unlock()
+		replies := s.replyRegistry()
+		replies.mu.Lock()
+		readerChan, ok := replies.pending[id]
+		replies.mu.Unlock()
 		emptySpace := xml.Name{Local: start.Name.Local}
 		if ok && (readerChan.stanzaName == start.Name || readerChan.stanzaName == emptySpace) {
 			inner := xmlstream.Inner(r)
@@ -627,14 +663,13 @@ func handleInputStream(s *Session, handler Handler) (err error) {
 				c: readerChan.c,
 			}:
 				<-readerChan.c
-			case <-readerChan.ctx.Done():
-			}
-			// Consume the rest of the stream before continuing the loop.
-			_, err = xmlstream.Copy(discard, inner)
-			if err != nil {
+				// Consume the rest of the stream before continuing the loop.
+				_, err = xmlstream.Copy(discard, inner)
+				handled = err == nil
 				return err
+			case <-readerChan.ctx.Done():
+				// The receiver abandoned the request. Dispatch normally.
 			}
-			return nil
 		}
 	}
 
@@ -663,6 +698,11 @@ func handleInputStream(s *Session, handler Handler) (err error) {
 		if fromAttr != "" {
 			to, err = jid.Parse(fromAttr)
 			if err != nil {
+				if s.sm != nil {
+					// There is no valid destination for a response. A
+					// permanent address error cannot be cured by replay.
+					return fmt.Errorf("%w: %v", stream.InvalidFrom, err)
+				}
 				return err
 			}
 		}
@@ -686,6 +726,7 @@ func handleInputStream(s *Session, handler Handler) (err error) {
 	// Advance to the end of the current element before attempting to read the
 	// next.
 	_, err = xmlstream.Copy(discard, rw)
+	handled = err == nil
 	return err
 }
 
@@ -842,6 +883,13 @@ func (lrc *lockReadCloser) Close() error {
 // After the TokenWriteCloser has been closed, any future writes will return
 // io.EOF.
 func (s *Session) TokenWriter() xmlstream.TokenWriteFlushCloser {
+	if err := s.waitForReplay(context.Background()); err != nil {
+		return &lockWriteCloser{err: err}
+	}
+	return s.tokenWriter()
+}
+
+func (s *Session) tokenWriter() xmlstream.TokenWriteFlushCloser {
 	s.out.Lock()
 
 	return &lockWriteCloser{
@@ -870,10 +918,22 @@ func (s *Session) TokenReader() xmlstream.TokenReadCloser {
 // Calling Close() multiple times will only result in one closing
 // </stream:stream> being sent.
 func (s *Session) Close() error {
+	if s.State()&OutputStreamClosed != 0 {
+		return nil
+	}
+	replayErr := s.waitForReplay(context.Background())
 	s.out.Lock()
 	defer s.out.Unlock()
 	s.stateMutex.Lock()
 	defer s.stateMutex.Unlock()
+
+	if replayErr != nil && s.state&OutputStreamClosed == 0 {
+		s.state |= OutputStreamClosed
+		s.sm.mu.Lock()
+		s.sm.id = ""
+		s.sm.mu.Unlock()
+		return replayErr
+	}
 
 	return s.closeSession()
 }
@@ -940,7 +1000,12 @@ func (s *Session) SetCloseDeadline(t time.Time) error {
 //
 // For more information see "encoding/xml".Encode.
 func (s *Session) Encode(ctx context.Context, v interface{}) (err error) {
-	s.out.Lock()
+	if err := s.waitForReplay(ctx); err != nil {
+		return err
+	}
+	if err := s.lockOutput(ctx); err != nil {
+		return err
+	}
 	defer s.out.Unlock()
 	if s.sm != nil && s.State()&OutputStreamClosed != 0 {
 		return ErrOutputStreamClosed
@@ -956,7 +1021,12 @@ func (s *Session) Encode(ctx context.Context, v interface{}) (err error) {
 //
 // For more information see "encoding/xml".EncodeElement.
 func (s *Session) EncodeElement(ctx context.Context, v interface{}, start xml.StartElement) (err error) {
-	s.out.Lock()
+	if err := s.waitForReplay(ctx); err != nil {
+		return err
+	}
+	if err := s.lockOutput(ctx); err != nil {
+		return err
+	}
 	defer s.out.Unlock()
 	if s.sm != nil && s.State()&OutputStreamClosed != 0 {
 		return ErrOutputStreamClosed
@@ -971,6 +1041,9 @@ func (s *Session) EncodeElement(ctx context.Context, v interface{}, start xml.St
 //
 // Send is safe for concurrent use by multiple goroutines.
 func (s *Session) Send(ctx context.Context, r xml.TokenReader) error {
+	if err := s.waitForReplay(ctx); err != nil {
+		return err
+	}
 	return send(ctx, s, r, nil)
 }
 
@@ -979,11 +1052,16 @@ func (s *Session) Send(ctx context.Context, r xml.TokenReader) error {
 //
 // SendElement is safe for concurrent use by multiple goroutines.
 func (s *Session) SendElement(ctx context.Context, r xml.TokenReader, start xml.StartElement) error {
+	if err := s.waitForReplay(ctx); err != nil {
+		return err
+	}
 	return send(ctx, s, r, &start)
 }
 
 func send(ctx context.Context, s *Session, r xml.TokenReader, start *xml.StartElement) (err error) {
-	s.out.Lock()
+	if err := s.lockOutput(ctx); err != nil {
+		return err
+	}
 	defer s.out.Unlock()
 	if s.sm != nil && s.State()&OutputStreamClosed != 0 {
 		return ErrOutputStreamClosed
@@ -1037,17 +1115,23 @@ func isStanzaEmptySpace(name xml.Name) bool {
 func (s *Session) sendResp(ctx context.Context, id string, payload xml.TokenReader, start xml.StartElement) (xmlstream.TokenReadCloser, error) {
 	c := make(chan xmlstream.TokenReadCloser)
 
-	s.sentStanzaMutex.Lock()
-	s.sentStanzas[id] = tokenReadChan{
-		stanzaName: start.Name,
-		c:          c,
-		ctx:        ctx,
+	replies := s.replyRegistry()
+	replies.mu.Lock()
+	if replies.pending == nil {
+		replies.pending = make(map[string]tokenReadChan)
 	}
-	s.sentStanzaMutex.Unlock()
+	if _, exists := replies.pending[id]; exists && s.sm != nil {
+		replies.mu.Unlock()
+		return nil, fmt.Errorf("xmpp: a response is already pending for stanza %q", id)
+	}
+	replies.pending[id] = tokenReadChan{stanzaName: start.Name, c: c, ctx: ctx}
+	replies.mu.Unlock()
 	defer func() {
-		s.sentStanzaMutex.Lock()
-		delete(s.sentStanzas, id)
-		s.sentStanzaMutex.Unlock()
+		replies.mu.Lock()
+		if replies.pending[id].c == c {
+			delete(replies.pending, id)
+		}
+		replies.mu.Unlock()
 	}()
 
 	err := s.SendElement(ctx, payload, start)
@@ -1060,6 +1144,8 @@ func (s *Session) sendResp(ctx context.Context, id string, payload xml.TokenRead
 		return rr, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-replies.ended:
+		return nil, ErrStreamManagementOutcomeUnknown
 	}
 }
 

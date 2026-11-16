@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,7 +56,9 @@ func TestStreamManagementResume(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	peer.write(`<a xmlns='urn:xmpp:sm:3' h='1'/><message id='committed'/><r xmlns='urn:xmpp:sm:3'/>`)
+	peer.write(`<a xmlns='urn:xmpp:sm:3' h='1'/><message id='committed'/>`)
+	awaitSMHandled(t, session, 1)
+	peer.write(`<r xmlns='urn:xmpp:sm:3'/>`)
 	ack, _ := peer.read("a")
 	peer.attr(ack, "h", "1")
 	if state := session.StreamManagement(); state.Acknowledged != 1 || state.Unacknowledged != 2 {
@@ -74,27 +77,33 @@ func TestStreamManagementResume(t *testing.T) {
 	peer.attr(resume, "h", "1")
 	peer.attr(resume, "previd", "original-id")
 	peer.write(`<resumed xmlns='urn:xmpp:sm:3' previd='original-id' h='2'/>`)
-	// A net.Pipe forces the client and peer to read concurrently. The peer
-	// writes its replay before reading the client's replay.
-	peer.write(`<message id='uncommitted'/>`)
+	resumed := peer.session()
+	go func() { served <- resumed.Serve(nil) }()
+	// Send more tokens than the read-ahead capacity before reading the
+	// client's replay. An early ACK request must not block the receive loop.
+	for range smMaxStanzas {
+		peer.write(`<message id='uncommitted'/>`)
+	}
+	peer.write(`<r xmlns='urn:xmpp:sm:3'/>`)
 	_, replay := peer.read("message")
 	if replay != original {
 		t.Fatalf("replay changed stanza bytes:\noriginal: %s\nreplayed: %s", original, replay)
 	}
-	resumed := peer.session()
+	peer.read("r")
+	peer.read("a")
 	if state := resumed.StreamManagement(); !state.Resumed || state.Acknowledged != 2 || state.Unacknowledged != 1 {
 		t.Fatalf("unexpected resumed state: %+v", state)
 	}
 	if got := resumed.LocalAddr().String(); got != "alice@example.net/original" {
 		t.Fatalf("restored address = %s", got)
 	}
-	go func() { served <- resumed.Serve(nil) }()
+	awaitSMHandled(t, resumed, smMaxStanzas+1)
 	peer.write(`<r xmlns='urn:xmpp:sm:3'/>`)
 	ack, _ = peer.read("a")
-	peer.attr(ack, "h", "2")
+	peer.attr(ack, "h", "257")
 	peer.write(`</stream:stream>`)
 	ack, _ = peer.read("a")
-	peer.attr(ack, "h", "2")
+	peer.attr(ack, "h", "257")
 	peer.read("stream close")
 	if err := <-served; err != nil {
 		t.Fatal(err)
@@ -144,9 +153,10 @@ func TestStreamManagementInterruptedReplay(t *testing.T) {
 	peer.write(`<resumed xmlns='urn:xmpp:sm:3' previd='original-id' h='0'/>`)
 	first, _ := peer.read("message")
 	peer.attr(first, "id", "first")
+	interrupted := peer.session()
 	peer.conn.Close()
-	if got := <-peer.ready; got.err == nil || got.s != nil {
-		t.Fatalf("interrupted replay returned an active session: %+v", got)
+	if err := interrupted.Serve(nil); err == nil {
+		t.Fatal("interrupted replay left an active session")
 	}
 
 	peer = newSMPeer(t, &management, true)
@@ -156,8 +166,222 @@ func TestStreamManagementInterruptedReplay(t *testing.T) {
 		msg, _ := peer.read("message")
 		peer.attr(msg, "id", id)
 	}
+	peer.read("r")
 	if state := peer.session().StreamManagement(); !state.Resumed || state.Acknowledged != 1 || state.Unacknowledged != 2 {
 		t.Fatalf("unexpected resumed state after replay interruption: %+v", state)
+	}
+}
+
+func TestStreamManagementBeforeEnabledAndBlockedHandler(t *testing.T) {
+	var management StreamManagement
+	peer := newSMPeer(t, &management, true)
+	peer.bind("alice@example.net/original", "")
+	peer.read("enable")
+	peer.write(`<message id='before'/><enabled xmlns='urn:xmpp:sm:3' id='original-id' resume='true' location='edge.example.net:5222'/>`)
+	session := peer.session()
+	if got := management.ResumeLocation(); got != "edge.example.net:5222" {
+		t.Fatalf("resume location = %q", got)
+	}
+	entered := make(chan string, 2)
+	unblock := make(chan struct{})
+	var release sync.Once
+	unblockHandler := func() { release.Do(func() { close(unblock) }) }
+	defer unblockHandler()
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- session.Serve(HandlerFunc(func(_ xmlstream.TokenReadEncoder, start *xml.StartElement) error {
+			id, _ := smAttr(*start, "id")
+			entered <- id
+			if id == "after" {
+				<-unblock
+			}
+			return nil
+		}))
+	}()
+	peer.write(`<message id='after'/>`)
+	for _, want := range []string{"before", "after"} {
+		select {
+		case got := <-entered:
+			if got != want {
+				t.Fatalf("got %q, want %q", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("message handler was not called")
+		}
+	}
+	peer.write(`<r xmlns='urn:xmpp:sm:3'/>`)
+	ack, _ := peer.read("a")
+	peer.attr(ack, "h", "0")
+	unblockHandler()
+	awaitSMHandled(t, session, 1)
+	peer.write(`<r xmlns='urn:xmpp:sm:3'/>`)
+	ack, _ = peer.read("a")
+	peer.attr(ack, "h", "1")
+}
+
+func TestStreamManagementPanicRetainsUnhandledStanza(t *testing.T) {
+	var management StreamManagement
+	peer := newSMPeer(t, &management, true)
+	peer.bind("alice@example.net/original", "original-id")
+	session := peer.session()
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() { panicked <- recover() }()
+		_ = session.Serve(HandlerFunc(func(xmlstream.TokenReadEncoder, *xml.StartElement) error {
+			panic("application failed")
+		}))
+	}()
+	peer.write(`<message id='unhandled'/>`)
+	out, err := io.ReadAll(peer.conn)
+	if err != nil || len(out) != 0 {
+		t.Fatalf("panic sent %q, err %v", out, err)
+	}
+	if got := <-panicked; got != "application failed" {
+		t.Fatalf("panic = %v", got)
+	}
+	if state := session.StreamManagement(); !state.Resumable || state.Handled != 0 {
+		t.Fatalf("panic changed recoverable state: %+v", state)
+	}
+}
+
+func TestStreamManagementAcknowledgesDuringClose(t *testing.T) {
+	var management StreamManagement
+	peer := newSMPeer(t, &management, true)
+	peer.bind("alice@example.net/original", "original-id")
+	session := peer.session()
+	peer.sendMessage(session, "outstanding")
+	served := make(chan error, 1)
+	go func() { served <- session.Serve(nil) }()
+	closed := make(chan error, 1)
+	go func() { closed <- session.Close() }()
+	peer.read("a")
+	const footer = "</stream:stream>"
+	raw := make([]byte, len(footer))
+	if _, err := io.ReadFull(peer.conn, raw); err != nil || string(raw) != footer {
+		t.Fatalf("closing stream: %q, %v", raw, err)
+	}
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	peer.write(`<a xmlns='urn:xmpp:sm:3' h='1'/><r xmlns='urn:xmpp:sm:3'/></stream:stream>`)
+	if err := <-served; err != nil {
+		t.Fatal(err)
+	}
+	if state := session.StreamManagement(); state.Acknowledged != 1 || state.Resumable || state.Unacknowledged != 0 {
+		t.Fatalf("final ACK was lost: %+v", state)
+	}
+}
+
+func TestStreamManagementIQReplyAfterResume(t *testing.T) {
+	var management StreamManagement
+	peer := newSMPeer(t, &management, true)
+	peer.bind("alice@example.net/original", "original-id")
+	session := peer.session()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	reply := make(chan error, 1)
+	go func() {
+		r, err := session.SendIQElement(ctx, xmlstream.Token(nil), stanza.IQ{ID: "replay-iq", Type: stanza.SetIQ})
+		if err == nil {
+			_, err = xmlstream.Copy(xmlstream.Discard(), r)
+			err = errors.Join(err, r.Close())
+		}
+		reply <- err
+	}()
+	peer.read("iq")
+	peer.conn.Close()
+	if err := session.Serve(nil); err == nil {
+		t.Fatal("missing transport error")
+	}
+	peer = newSMPeer(t, &management, true)
+	peer.read("resume")
+	peer.write(`<resumed xmlns='urn:xmpp:sm:3' previd='original-id' h='0'/>`)
+	resumed := peer.session()
+	served := make(chan error, 1)
+	go func() {
+		served <- resumed.Serve(HandlerFunc(func(xmlstream.TokenReadEncoder, *xml.StartElement) error {
+			return errors.New("reply escaped to general handler")
+		}))
+	}()
+	iq, _ := peer.read("iq")
+	peer.attr(iq, "id", "replay-iq")
+	peer.read("r")
+	peer.write(`<iq type='result' id='replay-iq'/>`)
+	if err := <-reply; err != nil {
+		t.Fatal(err)
+	}
+	awaitSMHandled(t, resumed, 1)
+}
+
+func TestStreamManagementRefusedEndsIQWaiter(t *testing.T) {
+	var management StreamManagement
+	peer := newSMPeer(t, &management, true)
+	peer.bind("alice@example.net/original", "original-id")
+	session := peer.session()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	reply := make(chan error, 1)
+	go func() {
+		_, err := session.SendIQElement(ctx, xmlstream.Token(nil), stanza.IQ{ID: "unanswered", Type: stanza.SetIQ})
+		reply <- err
+	}()
+	peer.read("iq")
+	peer.conn.Close()
+	if err := session.Serve(nil); err == nil {
+		t.Fatal("missing transport error")
+	}
+	peer = newSMPeer(t, &management, true)
+	peer.read("resume")
+	peer.write(`<failed xmlns='urn:xmpp:sm:3' h='1'/>`)
+	peer.bind("alice@example.net/fresh", "fresh-id")
+	if peer.session().StreamManagement().Resumed {
+		t.Fatal("refused stream resumed")
+	}
+	if err := <-reply; !errors.Is(err, ErrStreamManagementOutcomeUnknown) {
+		t.Fatalf("reply after refused resumption = %v", err)
+	}
+}
+
+func TestStreamManagementInvalidSenderDoesNotRecur(t *testing.T) {
+	var management StreamManagement
+	peer := newSMPeer(t, &management, true)
+	peer.bind("alice@example.net/original", "original-id")
+	session := peer.session()
+	served := make(chan error, 1)
+	go func() { served <- session.Serve(nil) }()
+	peer.write(`<iq type='get' id='bad-sender' from='@@@'/>`)
+	if err := <-served; err == nil || session.StreamManagement().Resumable {
+		t.Fatalf("permanent address error did not terminate the logical stream: %v", err)
+	}
+	peer = newSMPeer(t, &management, true)
+	peer.bind("alice@example.net/fresh", "fresh-id")
+	if peer.session().StreamManagement().Resumed {
+		t.Fatal("permanent address error was replayed")
+	}
+}
+
+func TestStreamManagementAckDeadlineWhileWriting(t *testing.T) {
+	var management StreamManagement
+	peer := newSMPeer(t, &management, true)
+	peer.bind("alice@example.net/original", "original-id")
+	session := peer.session()
+	writer := session.TokenWriter()
+	defer writer.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := session.RequestStreamManagementAck(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ack request under output lock = %v", err)
+	}
+}
+
+func awaitSMHandled(t *testing.T, s *Session, want uint32) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for s.StreamManagement().Handled != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("handled = %d, want %d", s.StreamManagement().Handled, want)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

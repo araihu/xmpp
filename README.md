@@ -43,11 +43,16 @@ If you'd like to contribute to the project, see [CONTRIBUTING.md].
 This fork adds opt-in [XEP-0198] for authenticated TLS client streams using
 SASL and regular resource binding. Keep one `xmpp.StreamManagement` per
 account and call its `Connect` method with each new TCP connection and the
-usual STARTTLS, SASL, and bind features.
+usual STARTTLS, SASL, and bind features. If `ResumeLocation` supplies a
+preferred endpoint, try dialing it with the original XMPP TLS identity and
+fall back to normal discovery if dialing fails.
 
-Run `Session.Serve` to consume incoming stanzas. Return success only after the
-application has accepted responsibility for the stanza. For a stored message,
-that means after committing it or confirming that it was already stored. Close
+Start `Session.Serve` before sending on a resumed session. The receive loop
+processes the peer's traffic while the client's replay is still running.
+New application writes follow the replay. Return success from the handler
+only after the application has accepted responsibility for the stanza. For a
+stored message, that means after committing it or confirming that it was
+already stored. Close
 the transport and wait for `Serve` to return before reconnecting, or call
 `Session.Close` to end the logical stream deliberately.
 
@@ -57,10 +62,15 @@ bytes of its unacknowledged outbound stanzas. An unavailable or refused
 resumption discards the old replay queue. The application can use its own
 archive recovery and reconciliation on the fresh stream.
 
-The replay queue is limited to 256 stanzas and 4 MiB. If it fills, the send
-returns `ErrStreamManagementQueueFull` and the connection closes so the
-remaining stanzas can be resumed. Resumption state stays in memory and lasts
-for the lifetime of the process.
+The replay queue is limited to 256 stanzas and 4 MiB. A send rejected with
+`ErrStreamManagementQueueFull` can be retried once the peer acknowledges
+enough earlier stanzas. A partial write can still be replayed, so use
+`ErrStreamManagementOutcomeUnknown` to distinguish uncertain outcomes from
+sends that can safely be retried. Pending request callbacks remain associated
+with the logical stream across successful resumption and receive this error
+if that stream ends first. Use cancellable contexts for requests.
+
+Resumption state stays in memory and lasts for the lifetime of the process.
 
 [XEP-0198]: https://xmpp.org/extensions/xep-0198.html
 

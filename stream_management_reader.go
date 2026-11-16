@@ -21,6 +21,7 @@ type smReadAhead struct {
 	stop    context.CancelFunc
 	budget  *semaphore.Weighted
 	results chan smReadResult
+	done    chan struct{}
 }
 
 type smReadResult struct {
@@ -29,22 +30,41 @@ type smReadResult struct {
 	size  int64
 }
 
-func newSMReadAhead(r xml.TokenReader) *smReadAhead {
+func newSMReadAhead(s *Session, r xml.TokenReader) *smReadAhead {
 	ctx, stop := context.WithCancel(context.Background())
 	a := &smReadAhead{
 		ctx:     ctx,
 		stop:    stop,
 		budget:  semaphore.NewWeighted(smMaxBytes),
 		results: make(chan smReadResult, smMaxStanzas),
+		done:    make(chan struct{}),
 	}
-	go a.read(r)
+	go a.read(s, r)
 	return a
 }
 
-func (a *smReadAhead) read(r xml.TokenReader) {
+func (a *smReadAhead) read(s *Session, r xml.TokenReader) {
+	defer close(a.done)
 	defer close(a.results)
+	depth := 0
 	for a.ctx.Err() == nil {
 		token, err := r.Token()
+		if err == nil {
+			switch t := token.(type) {
+			case xml.StartElement:
+				if depth == 0 && t.Name.Space == smNamespace {
+					err = s.handleSM(r, t)
+					if err == nil {
+						continue
+					}
+					token = nil
+				} else {
+					depth++
+				}
+			case xml.EndElement:
+				depth--
+			}
+		}
 		size := smTokenSize(token)
 		if size > smMaxBytes {
 			token, err, size = nil, errors.New("xmpp: stream management input buffer limit exceeded"), 0
@@ -79,13 +99,15 @@ func (a *smReadAhead) Token() (xml.Token, error) {
 func smTokenSize(token xml.Token) int64 {
 	switch tok := token.(type) {
 	case xml.CharData:
-		return int64(len(tok))
+		return 32 + int64(len(tok))
+	case xml.EndElement:
+		return 32 + int64(len(tok.Name.Local)+len(tok.Name.Space))
 	case xml.StartElement:
 		size := len(tok.Name.Local) + len(tok.Name.Space) + 64*len(tok.Attr)
 		for _, attr := range tok.Attr {
 			size += len(attr.Name.Local) + len(attr.Name.Space) + len(attr.Value)
 		}
-		return int64(size)
+		return 64 + int64(size)
 	}
-	return 0
+	return 32
 }

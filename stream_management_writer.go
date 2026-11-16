@@ -15,6 +15,32 @@ import (
 	"mellium.im/xmpp/stanza"
 )
 
+type smOutputLock chan struct{}
+
+func newSMOutputLock() smOutputLock {
+	return make(smOutputLock, 1)
+}
+
+func (l smOutputLock) Lock()   { l <- struct{}{} }
+func (l smOutputLock) Unlock() { <-l }
+
+func (s *Session) lockOutput(ctx context.Context) error {
+	if l, ok := s.out.Locker.(smOutputLock); ok {
+		select {
+		case l <- struct{}{}:
+			if err := ctx.Err(); err != nil {
+				l.Unlock()
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		return nil
+	}
+	s.out.Lock()
+	return nil
+}
+
 // RequestStreamManagementAck asks the peer to report its handled count. Serve
 // processes the response. The call has no effect when management is inactive.
 func (s *Session) RequestStreamManagementAck(ctx context.Context) error {
@@ -31,6 +57,7 @@ var errIncompleteManagedElement = errors.New("xmpp: incomplete element on a mana
 type smWriter struct {
 	xmlstream.TokenWriteFlusher
 	s            *Session
+	destination  io.Writer
 	depth        int
 	stanza       *xml.Encoder
 	wire         smBuffer
@@ -67,6 +94,9 @@ func (w *smWriter) EncodeToken(t xml.Token) error {
 	w.wire = smBuffer{}
 	w.stanza = nil
 	if err := w.send(wire); err != nil {
+		if errors.Is(err, ErrStreamManagementQueueFull) {
+			return err
+		}
 		return w.fail(err)
 	}
 	return nil
@@ -85,17 +115,21 @@ func (w *smWriter) send(wire []byte) error {
 	}
 	state.pending = append(state.pending, wire)
 	state.bytes += len(wire)
+	request := state.bytes >= smMaxBytes/2
 	state.mu.Unlock()
 
-	if err := smWrite(w.s.Conn(), wire); err != nil {
-		return err
+	if err := smWrite(w.destination, wire); err != nil {
+		return errors.Join(ErrStreamManagementOutcomeUnknown, err)
 	}
 	w.sinceRequest++
-	if w.sinceRequest < smAckInterval {
+	if w.sinceRequest < smAckInterval && !request {
 		return nil
 	}
 	w.sinceRequest = 0
-	return smWrite(w.s.Conn(), []byte(`<r xmlns="urn:xmpp:sm:3"/>`))
+	if err := smWrite(w.destination, []byte(smRequestXML)); err != nil {
+		return errors.Join(ErrStreamManagementOutcomeUnknown, err)
+	}
+	return nil
 }
 
 func (w *smWriter) Flush() error {

@@ -20,11 +20,13 @@ import (
 	"mellium.im/xmpp/internal/ns"
 	intstream "mellium.im/xmpp/internal/stream"
 	"mellium.im/xmpp/jid"
+	"mellium.im/xmpp/stanza"
 	"mellium.im/xmpp/stream"
 )
 
 const (
 	smNamespace        = "urn:xmpp:sm:3"
+	smRequestXML       = `<r xmlns="urn:xmpp:sm:3"/>`
 	smMaxStanzas       = 256
 	smMaxBytes         = 4 << 20
 	smAckInterval      = 8
@@ -35,6 +37,11 @@ const (
 // because the unacknowledged stanza buffer is full. Previously written stanzas
 // remain eligible for resumption.
 var ErrStreamManagementQueueFull = errors.New("xmpp: stream management queue full")
+
+// ErrStreamManagementOutcomeUnknown indicates a failed write after a stanza
+// was queued for replay, or that the logical stream ended while awaiting its
+// response. The peer might already have handled the stanza.
+var ErrStreamManagementOutcomeUnknown = errors.New("xmpp: stream management stanza outcome is unknown")
 
 var errStreamManagementProtocol = errors.New("xmpp: invalid stream management data")
 
@@ -47,6 +54,24 @@ type StreamManagement struct {
 	account  jid.JID
 	previous *Session
 	state    *smState
+}
+
+// ResumeLocation returns the server's preferred address for reconnecting, if
+// the previous stream is resumable and the server offered an address. It is
+// a dialing hint. Keep verifying TLS and authenticating for the original XMPP
+// domain, and fall back to normal discovery if dialing the hint fails.
+func (m *StreamManagement) ResumeLocation() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state == nil {
+		return ""
+	}
+	m.state.mu.Lock()
+	defer m.state.mu.Unlock()
+	if m.state.id == "" {
+		return ""
+	}
+	return m.state.location
 }
 
 // StreamManagementStatus reports the negotiated state of a client session.
@@ -80,10 +105,12 @@ func (s *Session) StreamManagement() StreamManagementStatus {
 // Connect authenticates a TCP client session on conn. It tries to resume the
 // previous authenticated stream before resource binding when possible. On
 // refusal or lack of support it negotiates a fresh stream. Stanzas from the
-// previous stream are replayed only after successful resumption.
+// previous stream are replayed only after successful resumption. Replay may
+// continue after Connect returns. Start Serve before sending on the resumed
+// session so it can receive the peer's own replay and acknowledgments.
 //
-// Run one Session.Serve loop to process a managed session. A stanza is handled once its
-// handler returns nil and the element has been consumed. Returning an error
+// Run one Session.Serve loop to process a managed session. A stanza is handled
+// once its handler returns nil and the element has been consumed. Returning an error
 // aborts the connection and leaves that stanza eligible for peer replay.
 // Internally routed IQ replies are handled after their reader is closed and
 // the element has been consumed. Use Session.Close to end a logical stream, or
@@ -98,8 +125,12 @@ func (m *StreamManagement) Connect(ctx context.Context, origin jid.JID, conn net
 		}
 	}()
 
-	if m.previous != nil && m.previous.State()&(InputStreamClosed|OutputStreamClosed) != InputStreamClosed|OutputStreamClosed {
-		return nil, errors.New("xmpp: previous managed session is still active")
+	if m.previous != nil {
+		select {
+		case <-m.previous.smDone:
+		default:
+			return nil, errors.New("xmpp: previous managed session is still active")
+		}
 	}
 	if !m.account.Equal(jid.JID{}) && !m.account.Equal(origin.Bare()) {
 		return nil, errors.New("xmpp: stream management account changed")
@@ -133,22 +164,6 @@ func (m *StreamManagement) Connect(ctx context.Context, origin jid.JID, conn net
 		s.reportSMCountError(err)
 		return nil, err
 	}
-	if s.smResumed && len(s.sm.pending) != 0 {
-		s.smReadAhead = newSMReadAhead(s.in.d)
-		s.in.d = s.smReadAhead
-		defer func() {
-			if err != nil {
-				s.smReadAhead.stop()
-			}
-		}()
-		// Keep the original queue even if another transport failure interrupts
-		// replay. The peer will report its newly handled prefix on the next try.
-		for _, wire := range s.sm.pending {
-			if err := smWrite(s.Conn(), wire); err != nil {
-				return nil, err
-			}
-		}
-	}
 	if s.sm == nil {
 		if m.state != nil {
 			m.state.discard()
@@ -166,11 +181,23 @@ func (m *StreamManagement) Connect(ctx context.Context, origin jid.JID, conn net
 		return nil, ctx.Err()
 	}
 	if s.sm != nil {
+		s.smDone = make(chan struct{})
 		// The top-level stanza encoder adds IDs and normalizes namespaces before
 		// the stream management writer serializes the final bytes.
 		stanzaWriter := s.out.e.(*stanzaEncoder)
-		s.smWriter = &smWriter{s: s, TokenWriteFlusher: stanzaWriter.TokenWriteFlusher}
+		s.out.Locker = newSMOutputLock()
+		var wire io.Writer = s.Conn()
+		if s.smResumed && len(s.sm.pending) != 0 {
+			s.smReplay = &smReplay{session: s, done: make(chan struct{})}
+			wire = s.smReplay
+		}
+		s.smWriter = &smWriter{s: s, destination: wire, TokenWriteFlusher: xml.NewEncoder(wire)}
 		stanzaWriter.TokenWriteFlusher = s.smWriter
+		if s.smReplay != nil {
+			// Detach the slice from live ACK trimming. Individual byte
+			// slices are immutable after their initial serialization.
+			go s.smReplay.run(append([][]byte(nil), s.sm.pending...))
+		}
 		m.previous = s
 	} else {
 		m.previous = nil
@@ -182,7 +209,7 @@ func (m *StreamManagement) enable(ctx context.Context, s *Session) error {
 	if err := smSend(ctx, s, "enable", xml.Attr{Name: xml.Name{Local: "resume"}, Value: "true"}); err != nil {
 		return err
 	}
-	start, err := smReply(s)
+	start, err := smReply(s, true)
 	if err != nil {
 		return err
 	}
@@ -202,7 +229,11 @@ func (m *StreamManagement) enable(ctx context.Context, s *Session) error {
 		default:
 			return fmt.Errorf("%w: invalid resume attribute", errStreamManagementProtocol)
 		}
-		s.sm = &smState{id: id, bound: s.LocalAddr()}
+		location, _ := smAttr(start, "location")
+		s.sm = &smState{
+			id: id, bound: s.LocalAddr(), location: location,
+			replies: stanzaReplies{ended: make(chan struct{})},
+		}
 		m.state = s.sm
 		return nil
 	default:
@@ -218,8 +249,11 @@ func (m *StreamManagement) resume(ctx context.Context, s *Session) (bool, error)
 	); err != nil {
 		return false, err
 	}
-	start, err := smReply(s)
+	start, err := smReply(s, false)
 	if err != nil {
+		if permanentSMError(err) {
+			state.discard()
+		}
 		return false, err
 	}
 	if start.Name == smName("failed") {
@@ -263,27 +297,66 @@ func smSend(ctx context.Context, s *Session, local string, attrs ...xml.Attr) er
 	return s.Send(ctx, xmlstream.Wrap(nil, xml.StartElement{Name: smName(local), Attr: attrs}))
 }
 
-func smReply(s *Session) (xml.StartElement, error) {
-	tok, err := decl.TrimLeftSpace(s.in.d).Token()
-	if err != nil {
-		return xml.StartElement{}, err
+func smReply(s *Session, enabling bool) (xml.StartElement, error) {
+	var prefix []xml.Token
+	var buffered int64
+	for {
+		tok, err := decl.TrimLeftSpace(s.in.d).Token()
+		if err != nil {
+			return xml.StartElement{}, err
+		}
+		start, ok := tok.(xml.StartElement)
+		if !ok {
+			return xml.StartElement{}, fmt.Errorf("%w: expected a stream management reply", errStreamManagementProtocol)
+		}
+		if err := decodeStreamErr(start, s.in.d); err != nil {
+			return xml.StartElement{}, err
+		}
+		if enabling && stanza.Is(start.Name, s.in.XMLNS) {
+			if s.smPreEnabled == smMaxStanzas {
+				return xml.StartElement{}, errors.New("xmpp: too many stanzas received before stream management was enabled")
+			}
+			r := xmlstream.MultiReader(xmlstream.Token(start), xmlstream.InnerElement(s.in.d))
+			for {
+				t, err := r.Token()
+				if err != nil && err != io.EOF {
+					return xml.StartElement{}, err
+				}
+				if t != nil {
+					buffered += smTokenSize(t)
+					if buffered > smMaxBytes {
+						return xml.StartElement{}, errors.New("xmpp: stream management input buffer limit exceeded")
+					}
+					prefix = append(prefix, xml.CopyToken(t))
+				}
+				if err == io.EOF {
+					break
+				}
+			}
+			s.smPreEnabled++
+			continue
+		}
+		if start.Name.Space != smNamespace {
+			return xml.StartElement{}, fmt.Errorf("%w: unexpected reply %v", errStreamManagementProtocol, start.Name)
+		}
+		if start.Name.Local == "failed" {
+			_, err = xmlstream.Copy(xmlstream.Discard(), xmlstream.InnerElement(s.in.d))
+		} else {
+			err = smEnd(s.in.d, start)
+		}
+		if err == nil && len(prefix) != 0 {
+			s.in.d = xmlstream.MultiReader(xmlstream.ReaderFunc(func() (xml.Token, error) {
+				if len(prefix) == 0 {
+					return nil, io.EOF
+				}
+				t := prefix[0]
+				prefix[0] = nil
+				prefix = prefix[1:]
+				return t, nil
+			}), s.in.d)
+		}
+		return start, err
 	}
-	start, ok := tok.(xml.StartElement)
-	if !ok {
-		return xml.StartElement{}, fmt.Errorf("%w: expected a stream management reply", errStreamManagementProtocol)
-	}
-	if err := decodeStreamErr(start, s.in.d); err != nil {
-		return xml.StartElement{}, err
-	}
-	if start.Name.Space != smNamespace {
-		return xml.StartElement{}, fmt.Errorf("%w: unexpected reply %v", errStreamManagementProtocol, start.Name)
-	}
-	if start.Name.Local == "failed" {
-		_, err = xmlstream.Copy(xmlstream.Discard(), xmlstream.InnerElement(s.in.d))
-	} else {
-		err = smEnd(s.in.d, start)
-	}
-	return start, err
 }
 
 func smEnd(r xml.TokenReader, start xml.StartElement) error {
@@ -310,18 +383,23 @@ func (s *Session) handleSM(r xml.TokenReader, start xml.StartElement) error {
 		s.sm.mu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), smHandshakeTimeout)
 		defer cancel()
-		return smSend(ctx, s, "a", smCounter(h))
+		err := send(ctx, s, xmlstream.Wrap(nil, xml.StartElement{Name: smName("a"), Attr: []xml.Attr{smCounter(h)}}), nil)
+		if errors.Is(err, ErrOutputStreamClosed) {
+			return nil
+		}
+		return err
 	default:
 		return fmt.Errorf("%w: unexpected element %v", errStreamManagementProtocol, start.Name)
 	}
 }
 
-func (s *Session) finishManagedServe(err error) {
+func (s *Session) finishManagedServe(err error, graceful bool) {
+	defer close(s.smDone)
 	s.reportSMCountError(err)
 	if s.smReadAhead != nil {
 		s.smReadAhead.stop()
 	}
-	if err == nil {
+	if graceful {
 		_ = s.Conn().SetWriteDeadline(time.Now().Add(smHandshakeTimeout))
 		// Reply to a graceful peer close and send our final handled count.
 		_ = s.Close()
@@ -329,11 +407,12 @@ func (s *Session) finishManagedServe(err error) {
 	// Wake blocked writers before taking the output lock. A transport failure
 	// or handler error must leave the logical stream available for resumption.
 	_ = s.Conn().Close()
+	_ = s.waitForReplay(context.Background())
+	<-s.smReadAhead.done
 	s.closeInputStream()
 	s.out.Lock()
 	defer s.out.Unlock()
-	var se stream.Error
-	if errors.Is(err, errStreamManagementProtocol) || errors.As(err, &se) {
+	if graceful || !s.StreamManagement().Resumable || s.State()&OutputStreamClosed != 0 || permanentSMError(err) {
 		s.sm.discard()
 	}
 	s.stateMutex.Lock()
@@ -341,14 +420,19 @@ func (s *Session) finishManagedServe(err error) {
 	s.stateMutex.Unlock()
 }
 
+func permanentSMError(err error) bool {
+	var se stream.Error
+	var syntax *xml.SyntaxError
+	return errors.Is(err, errStreamManagementProtocol) || errors.As(err, &se) ||
+		errors.Is(err, intstream.ErrUnexpectedRestart) || errors.Is(err, intstream.ErrUnknownStreamElement) ||
+		(errors.As(err, &syntax) && syntax.Msg != "unexpected EOF")
+}
+
 func (s *Session) closeManagedStream() error {
-	if s.smReadAhead != nil {
-		defer s.smReadAhead.stop()
-	}
 	s.sm.mu.Lock()
 	h := s.sm.handled
+	s.sm.id = ""
 	s.sm.mu.Unlock()
-	s.sm.discard()
 	if err := s.Conn().SetWriteDeadline(time.Now().Add(smHandshakeTimeout)); err != nil {
 		return err
 	}
@@ -358,13 +442,16 @@ func (s *Session) closeManagedStream() error {
 }
 
 type smState struct {
-	mu      sync.Mutex
-	bound   jid.JID
-	id      string
-	handled uint32
-	acked   uint32
-	pending [][]byte
-	bytes   int
+	mu        sync.Mutex
+	bound     jid.JID
+	id        string
+	handled   uint32
+	acked     uint32
+	pending   [][]byte
+	bytes     int
+	location  string
+	replies   stanzaReplies
+	discarded bool
 }
 
 func (s *smState) discard() {
@@ -373,6 +460,10 @@ func (s *smState) discard() {
 	s.id = ""
 	s.pending = nil
 	s.bytes = 0
+	if !s.discarded && s.replies.ended != nil {
+		close(s.replies.ended)
+	}
+	s.discarded = true
 }
 
 func (s *smState) acknowledge(start xml.StartElement) error {
@@ -413,6 +504,18 @@ func (s *Session) reportSMCountError(err error) {
 	var count smCountError
 	if !errors.As(err, &count) {
 		return
+	}
+	if s.smReplay != nil {
+		// During replay the transport has an active writer. Close it
+		// without interleaving a stream error with retransmitted bytes.
+		select {
+		case <-s.smReplay.done:
+			if s.smReplay.err != nil {
+				return
+			}
+		default:
+			return
+		}
 	}
 	_ = s.Conn().SetWriteDeadline(time.Now().Add(smHandshakeTimeout))
 	s.out.Lock()
