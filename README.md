@@ -1,5 +1,15 @@
 # XMPP
 
+This repository is the Arai Hû fork of [Mellium XMPP], the Go XMPP library
+developed by the Mellium Contributors. The upstream authors and contributors
+are credited in [CONTRIBUTORS](CONTRIBUTORS). Their work remains available
+under the original [BSD 2-Clause license](LICENSE).
+
+Arai Hû maintains this fork for Oiê and publishes its own releases. Its first
+addition is opt-in client stream management and resumption (XEP-0198).
+
+[Mellium XMPP]: https://codeberg.org/mellium/xmpp
+
 [![GoDoc](https://godoc.org/mellium.im/xmpp?status.svg)][docs]
 [![Chat](https://img.shields.io/badge/XMPP-users@mellium.chat-orange.svg)](https://mellium.chat)
 [![License](https://img.shields.io/badge/license-FreeBSD-blue.svg)](https://opensource.org/licenses/BSD-2-Clause)
@@ -36,6 +46,42 @@ If you're looking to get started and need some help, see the [API docs][docs] or
 look in the `examples/` tree for several simple usage examples.
 
 If you'd like to contribute to the project, see [CONTRIBUTING.md].
+
+
+## Client stream management
+
+This fork adds opt-in [XEP-0198] for authenticated TLS client streams using
+SASL and regular resource binding. Keep one `xmpp.StreamManagement` per
+account and call its `Connect` method with each new TCP connection and the
+usual STARTTLS, SASL, and bind features. If `ResumeLocation` supplies a
+preferred endpoint, try dialing it with the original XMPP TLS identity and
+fall back to normal discovery if dialing fails.
+
+Start `Session.Serve` before sending on a resumed session. The receive loop
+processes the peer's traffic while the client's replay is still running.
+New application writes follow the replay. Return success from the handler
+only after the application has accepted responsibility for the stanza. For a
+stored message, that means after committing it or confirming that it was
+already stored. Close the transport and wait for `Serve` to return before reconnecting, or call
+`Session.Close` to end the logical stream deliberately.
+
+`Session.StreamManagement().Resumed` distinguishes an accepted resumption
+from a fresh bind. A resumed stream keeps its resource and replays the exact
+bytes of its unacknowledged outbound stanzas. An unavailable or refused
+resumption discards the old replay queue. The application can use its own
+archive recovery and reconciliation on the fresh stream.
+
+The replay queue is limited to 256 stanzas and 4 MiB. A send rejected with
+`ErrStreamManagementQueueFull` can be retried once the peer acknowledges
+enough earlier stanzas. A partial write can still be replayed, so use
+`ErrStreamManagementOutcomeUnknown` to distinguish uncertain outcomes from
+sends that can safely be retried. Pending request callbacks remain associated
+with the logical stream across successful resumption and receive this error
+if that stream ends first. Use cancellable contexts for requests.
+
+Resumption state stays in memory and lasts for the lifetime of the process.
+
+[XEP-0198]: https://xmpp.org/extensions/xep-0198.html
 
 
 ## License
